@@ -1,0 +1,31 @@
+{
+  "name": "omi-server",
+  "version": "1.0.0",
+  "description": "Omi server with Firestore integration",
+  "main": "server/serverv2.js",
+  "scripts": {
+    "start": "node server/serverv2.js",
+    "dev": "nodemon server/serverv2.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.24.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "axios": "^1.6.7",
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "firebase-admin": "^12.0.0",
+    "openai": "^4.89.0",
+    "uuid": "^9.0.1",
+    "winston": "^3.17.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "author": "",
+  "license": "ISC"
+}
