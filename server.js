@@ -5,15 +5,27 @@ const winston = require('winston');
 // Import Firebase modules
 const { db, admin, documentIdFromSeed, createRequiredIndexes, initializeCollections, COLLECTIONS } = require('./firebase');
 const memories = require('./memories');
-const ApiQueue = require('./apiQueue');
-
 const uuid = require('uuid');
 
 dotenv.config();
 
-// Initialize Express app
-const app = express();
-app.use(express.json());
+// Configure Winston logger first
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.File({ filename: 'mentor.log' }),
+    new winston.transports.Console({
+      format: winston.format.simple()
+    })
+  ]
+});
+
+// Import ApiQueue after logger is initialized
+const ApiQueue = require('./apiQueue');
 
 // Initialize OpenAI
 const openai = new OpenAI({
@@ -35,37 +47,15 @@ const MODELS = {
   QUICK: 'gpt-4'  // Changed from gpt-3.5-turbo to gpt-4
 };
 
+// Initialize Express app
+const app = express();
+app.use(express.json());
+
 // Initialize Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
-
-// Configure Winston logger
-const logger = winston.createLogger({
-  level: 'info',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  ),
-  transports: [
-    new winston.transports.File({ filename: 'mentor.log' }),
-    new winston.transports.Console({
-      format: winston.format.simple()
-    })
-  ]
-});
-
-// Database schema constants
-const DB_SCHEMAS = {
-  USERS: 'users',
-  TASKS: 'tasks',
-  NUTRITION_LOGS: 'nutrition_logs',
-  CONVERSATIONS: 'conversations',  // For storing conversations
-  USER_CONTEXT: 'user_context',    // For storing user context
-  USER_PREFERENCES: 'user_preferences',  // For storing personalized preferences
-  HEALTH_LOGS: 'health_logs'       // For storing health data
-};
 
 // Add these constants at the top of your file
 const SILENCE_THRESHOLD = 1.0; // 1 second gap between segments to consider it a silence
