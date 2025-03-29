@@ -1,11 +1,11 @@
 const express = require('express');
 const dotenv = require('dotenv');
 const { OpenAI } = require('openai');
-const { createClient } = require('@supabase/supabase-js');
 const winston = require('winston');
 // Import Firebase modules
 const { db, admin, documentIdFromSeed, createRequiredIndexes, initializeCollections, COLLECTIONS } = require('./firebase');
 const memories = require('./memories');
+const ApiQueue = require('./apiQueue');
 
 const uuid = require('uuid');
 
@@ -18,6 +18,14 @@ app.use(express.json());
 // Initialize OpenAI
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY // Add your API key to .env file
+});
+
+// Initialize API Queue for OpenAI requests
+const openaiQueue = new ApiQueue({
+  maxConcurrent: 50, // Limit concurrent requests
+  maxRetries: 3,     // Retry rate limit errors up to 3 times
+  baseDelay: 2000,   // Start with 2s delay (then 4s, 8s for exponential backoff)
+  logger: logger     // Use the same logger as the rest of the app
 });
 
 // OpenAI model configurations
@@ -72,9 +80,9 @@ class MessageBuffer {
     this.MIN_WORDS_AFTER_SILENCE = 15;
     this.ANALYSIS_INTERVAL = 20000;
     this.QUESTION_AGGREGATION_TIME = 5000; // 5 seconds
-    this.TRIGGER_PHRASES = ['hey omi', 'hey, omi'];
+    this.TRIGGER_PHRASES = ['hey omira', 'hey, omira'];
     this.PARTIAL_FIRST = ['hey', 'hey,'];
-    this.PARTIAL_SECOND = ['omi'];
+    this.PARTIAL_SECOND = ['omira'];
     this.NOTIFICATION_COOLDOWN = 10000; // 10 seconds
     this.notificationCooldowns = new Map();
     this.MEMORY_TTL = 86400000; // 24 hours for session memory
@@ -587,274 +595,26 @@ const agents = {
   }
 };
 
-// Enhanced function to detect instruction type
-async function detectInstructionType(text, sessionId) {
-  try {
-    const prompt = `Analyze this text and categorize it into one of these types:
-    1. "conversation" - if it's about a conversation, discussion, argument, meeting, or any human interaction
-    2. "nutrition" - if it's about food, eating, diet, meals
-    3. "productivity" - if it's about tasks, work, deadlines, meetings
-    4. "health" - if it's about fitness, exercise, wellness
-    5. "general" - if it doesn't fit any of the above
-
-    Text: "${text}"
-
-    Return ONLY a single word category from the list above. No explanation needed.`;
-
-    const result = await openai.chat.completions.create({
-      model: MODELS.REASONING,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      max_tokens: 1000,
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0
-    });
-    const category = result.choices[0].message.content.trim().toLowerCase();
-
-    logger.info(`Detected instruction type: ${category}`);
-
-    // Additional analysis for specific categories
-    if (category === 'conversation') {
-      const convAnalysisPrompt = `Analyze this conversation text:
-      "${text}"
-      
-      Is this:
-      1. An argument or disagreement
-      2. A presentation or meeting
-      3. A casual conversation
-      4. Feedback being given
-      
-      Return ONLY a single number (1-4).`;
-
-      const convResult = await openai.chat.completions.create({
-        model: MODELS.QUICK,
-        messages: [{ role: 'user', content: convAnalysisPrompt }],
-        temperature: 0.3,
-        max_tokens: 1000,
-        top_p: 1,
-        frequency_penalty: 0,
-        presence_penalty: 0
-      });
-      const convType = parseInt(convResult.choices[0].message.content.trim());
-
-      return {
-        type: 'conversation',
-        conversationType: convType === 1 ? 'argument' :
-          convType === 2 ? 'meeting' :
-            convType === 3 ? 'casual' : 'feedback'
-      };
-    }
-
-    if (category === 'nutrition') {
-      const mealAnalysisPrompt = `From this text about food:
-      "${text}"
-      
-      Which meal is being discussed:
-      1. Breakfast
-      2. Lunch
-      3. Dinner
-      4. Snack
-      
-      Return ONLY a single number (1-4).`;
-
-      const mealResult = await openai.chat.completions.create({
-        model: MODELS.QUICK,
-        messages: [{ role: 'user', content: mealAnalysisPrompt }],
-        temperature: 0.3,
-        max_tokens: 1000,
-        top_p: 1,
-        frequency_penalty: 0,
-        presence_penalty: 0
-      });
-      const mealType = parseInt(mealResult.choices[0].message.content.trim());
-
-      return {
-        type: 'nutrition',
-        mealType: mealType === 1 ? 'breakfast' :
-          mealType === 2 ? 'lunch' :
-            mealType === 3 ? 'dinner' : 'snack'
-      };
-    }
-
-    return { type: category };
-  } catch (error) {
-    logger.error('Instruction detection error:', error);
-    return { type: 'general' };
-  }
-}
-
-async function generateGeneralResponse(text, sessionId) {
-  try {
-    const context = messageBuffer.getUserContext(sessionId);
-    const prompt = `As Omi, respond to: ${text}\n\nUser context: ${JSON.stringify(context)}`;
-
-    const result = await openai.chat.completions.create({
-      model: MODELS.REASONING,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      max_tokens: 1000,
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0
-    });
-    return result.choices[0].message.content;
-  } catch (error) {
-    logger.error('General response error:', error);
-    return "I'm having trouble processing that. Could you rephrase?";
-  }
-}
-
-async function generateResponse(category, sessionId, currentText) {
-  try {
-    const agent = agents[category];
-    const userContext = messageBuffer.getUserContext(sessionId);
-    const prompt = agent.prompt(userContext, currentText);
-    const result = await openai.chat.completions.create({
-      model: MODELS.REASONING,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      max_tokens: 1000,
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0
-    });
-
-    // Get the raw text from the response
-    const rawResponse = result.choices[0].message.content;
-
-    // Check if the response is formatted as markdown code block
-    // and extract the JSON content
-    let jsonString = rawResponse;
-    if (rawResponse.includes('```')) {
-      // Extract content between code blocks
-      const match = rawResponse.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-      if (match && match[1]) {
-        jsonString = match[1].trim();
-      }
-    }
-
-    // Parse the JSON
-    const response = JSON.parse(jsonString);
-
-    // Log the generated response
-    console.log('Generated response:', response);
-
-    messageBuffer.addUserContext(sessionId, currentText);
-    return response;
-  } catch (error) {
-    logger.error('Error generating response:', error);
-    return {
-      response: "I'm having trouble processing that analysis. Please try again.",
-      dashboard_summary: "Analysis processing error",
-      analysis: {
-        error: true,
-        message: error.message
-      }
-    };
-  }
-}
-
-async function storeTasks(sessionId, tasks) {
-  try {
-    const tasksToInsert = tasks.map(task => ({
-      user_id: sessionId,
-      title: task.title,
-      deadline: new Date(task.deadline).toISOString(),
-      priority: task.priority,
-      metadata: {
-        duration_min: task.duration_min,
-        dependencies: task.dependencies,
-        owner: task.owner
-      }
-    }));
-
-    const { data, error } = await supabase
-      .from(DB_SCHEMAS.TASKS)
-      .insert(tasksToInsert)
-      .select();
-
-    if (error) throw error;
-    return data;
-  } catch (error) {
-    logger.error('Task storage error:', error);
-    return null;
-  }
-}
-
-async function storeNutritionLog(sessionId, analysis) {
-  try {
-    const totalCalories = analysis.items.reduce((sum, item) => sum + (item.calories || 0), 0);
-    const totalProtein = analysis.items.reduce((sum, item) => sum + (item.protein_g || 0), 0);
-    const totalCarbs = analysis.items.reduce((sum, item) => sum + (item.carbs_g || 0), 0);
-    const totalFats = analysis.items.reduce((sum, item) => sum + (item.fats_g || 0), 0);
-
-    const nutritionData = {
-      user_id: sessionId,
-      meal_type: analysis.mealType,
-      foods: analysis.items,
-      total_calories: totalCalories,
-      total_protein: totalProtein,
-      total_carbs: totalCarbs,
-      total_fats: totalFats,
-      meal_time: new Date().toISOString()
-    };
-
-    const { data, error } = await supabase
-      .from(DB_SCHEMAS.NUTRITION_LOGS)
-      .insert(nutritionData)
-      .select();
-
-    if (error) throw error;
-    return data;
-  } catch (error) {
-    logger.error('Nutrition log storage error:', error);
-    return null;
-  }
-}
-
-// New storage functions for additional agents
-async function storeHealthActivity(sessionId, analysis) {
-  try {
-    const healthData = {
-      user_id: sessionId,
-      activity_type: analysis.activityType,
-      duration: analysis.metrics?.duration_min || 0,
-      intensity: analysis.metrics?.intensity || 'medium',
-      calories_burned: analysis.metrics?.calories_burned || 0,
-      sleep_hours: analysis.sleepData?.hours || 0,
-      sleep_quality: analysis.sleepData?.quality || 'fair',
-      recorded_at: new Date().toISOString()
-    };
-
-    const { data, error } = await supabase
-      .from(DB_SCHEMAS.HEALTH_LOGS)
-      .insert(healthData)
-      .select();
-
-    if (error) throw error;
-    return data;
-  } catch (error) {
-    logger.error('Health activity storage error:', error);
-    return null;
-  }
-}
-
-// Function to generate structured JSON response
+// Modified function to use the queue
 async function generateStructuredResponse(prompt, model = MODELS.REASONING) {
   try {
-    const response = await openai.chat.completions.create({
-      model: model,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are an AI assistant that ALWAYS responds in valid JSON format. Your response should be a raw JSON object without any markdown formatting, explanation text, or code blocks. Do not include any text outside the JSON structure.'
-        },
-        { role: 'user', content: prompt }
-      ],
-      temperature: 0.7,
-      max_tokens: 1000
-    });
+    // Queue the API call
+    const response = await openaiQueue.enqueue(
+      // Function that returns the API call promise
+      () => openai.chat.completions.create({
+        model: model,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an AI assistant that ALWAYS responds in valid JSON format. Your response should be a raw JSON object without any markdown formatting, explanation text, or code blocks. Do not include any text outside the JSON structure.'
+          },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.7,
+        max_tokens: 1000
+      }),
+      `generateStructuredResponse (${model})`
+    );
 
     const content = response.choices[0].message.content.trim();
 
@@ -886,7 +646,6 @@ async function generateStructuredResponse(prompt, model = MODELS.REASONING) {
   }
 }
 
-// Function to analyze conversation and generate friendly reflection
 async function generateConversationReflection(text, context = {}) {
   try {
     const prompt = `Imagine you're the user's best friend giving them casual feedback about a conversation they just had. React like you're texting them or chatting over coffee - be genuine, personal, and conversational.
@@ -913,23 +672,28 @@ async function generateConversationReflection(text, context = {}) {
 
   Make it sound like a real person talking to their friend - not an analysis, report, or professional feedback.`;
 
-    const result = await openai.chat.completions.create({
-      model: MODELS.REASONING,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a close friend giving casual, genuine feedback. Use natural, conversational language. Be supportive but real - like a friend chatting over coffee.'
-        },
-        {
-          role: 'user',
-          content: prompt
-        }
-      ],
-      temperature: 0.9, // Increased for more natural variation
-      max_tokens: 1000,
-      presence_penalty: 0.6, // Added to encourage more unique responses
-      frequency_penalty: 0.6 // Added to discourage repetitive language
-    });
+    // Queue the API call
+    const result = await openaiQueue.enqueue(
+      // Function that returns the API call promise
+      () => openai.chat.completions.create({
+        model: MODELS.REASONING,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a close friend giving casual, genuine feedback. Use natural, conversational language. Be supportive but real - like a friend chatting over coffee.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.9, // Increased for more natural variation
+        max_tokens: 1000,
+        presence_penalty: 0.6, // Added to encourage more unique responses
+        frequency_penalty: 0.6 // Added to discourage repetitive language
+      }),
+      `generateConversationReflection (${MODELS.REASONING})`
+    );
 
     let reflection = JSON.parse(result.choices[0].message.content);
     return reflection;
@@ -1188,51 +952,6 @@ async function processMemoryObject(memory, uid, res) {
   }
 }
 
-// Webhook handler
-app.post('/webhook', async (req, res) => {
-  try {
-    // Extract the user ID from query parameters (primary) or body (fallback)
-    const uid = req.query.uid || req.body.session_id || req.body.uid;
-
-    if (!uid) {
-      return res.status(400).json({
-        success: false,
-        message: 'No user identification provided. Please include uid as a query parameter.'
-      });
-    }
-
-    // Rate limiting check
-    const currentTime = Date.now();
-    const cooldownTime = messageBuffer.notificationCooldowns.get(uid) || 0;
-    if (currentTime - cooldownTime < 1000) { // 1 second cooldown
-      return res.status(429).json({
-        success: false,
-        message: 'Too many requests. Please try again shortly.'
-      });
-    }
-
-    // Determine the type of payload (memory object or real-time transcript)
-    const isMemory = req.body.id !== undefined &&
-      req.body.transcript_segments !== undefined;
-
-    if (isMemory) {
-      // Process memory object - this will store it in Firestore under the user's collection
-      return await processMemoryObject(req.body, uid, res);
-    } else {
-      // Process real-time transcript
-      return await processRealTimeTranscript(req.body, uid, res);
-    }
-  } catch (error) {
-    console.error('Webhook processing error:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: error.message
-    });
-  }
-});
-
-// Function to process real-time transcript
 async function processRealTimeTranscript(data, uid, res) {
   try {
     console.log('Received data:', JSON.stringify(data));
@@ -1362,15 +1081,18 @@ async function processRealTimeTranscript(data, uid, res) {
               just answer based on your knowledge.
             `;
 
-            const result = await openai.chat.completions.create({
-              model: MODELS.REASONING,
-              messages: [{ role: 'user', content: prompt }],
-              temperature: 0.7,
-              max_tokens: 1000,
-              top_p: 1,
-              frequency_penalty: 0,
-              presence_penalty: 0
-            });
+            const result = await openaiQueue.enqueue(
+              () => openai.chat.completions.create({
+                model: MODELS.REASONING,
+                messages: [{ role: 'user', content: prompt }],
+                temperature: 0.7,
+                max_tokens: 1000,
+                top_p: 1,
+                frequency_penalty: 0,
+                presence_penalty: 0
+              }),
+              `generateResponse (${MODELS.REASONING})`
+            );
             const response = result.choices[0].message.content.trim();
             console.log(`Generated response: ${response}`);
 
@@ -1440,13 +1162,71 @@ async function processRealTimeTranscript(data, uid, res) {
   }
 }
 
-// Health check endpoint
+// Webhook handler
+app.post('/webhook', async (req, res) => {
+  try {
+    // Extract the user ID from query parameters (primary) or body (fallback)
+    const uid = req.query.uid || req.body.session_id || req.body.uid;
+
+    if (!uid) {
+      return res.status(400).json({
+        success: false,
+        message: 'No user identification provided. Please include uid as a query parameter.'
+      });
+    }
+
+    // Rate limiting check
+    const currentTime = Date.now();
+    const cooldownTime = messageBuffer.notificationCooldowns.get(uid) || 0;
+    if (currentTime - cooldownTime < 1000) { // 1 second cooldown
+      return res.status(429).json({
+        success: false,
+        message: 'Too many requests. Please try again shortly.'
+      });
+    }
+
+    // Determine the type of payload (memory object or real-time transcript)
+    const isMemory = req.body.id !== undefined &&
+      req.body.transcript_segments !== undefined;
+
+    if (isMemory) {
+      // Process memory object - this will store it in Firestore under the user's collection
+      return await processMemoryObject(req.body, uid, res);
+    } else {
+      // Process real-time transcript
+      return await processRealTimeTranscript(req.body, uid, res);
+    }
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Internal server error',
+      error: error.message
+    });
+  }
+});
+
 app.get('/health', (req, res) => {
   logger.info('Health check endpoint accessed');
   res.status(200).json({ status: 'ok', version: '1.0.0' });
 });
 
-// Add a simple endpoint to retrieve memories for a user
+// Add queue stats endpoint
+app.get('/queue-stats', (req, res) => {
+  // Only return queue stats if this is an admin request with correct API key
+  const apiKey = req.headers['x-api-key'];
+  if (apiKey !== process.env.ADMIN_API_KEY) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+
+  const stats = openaiQueue.getStats();
+  res.status(200).json({
+    status: 'ok',
+    queue_stats: stats,
+    timestamp: new Date().toISOString()
+  });
+});
+
 app.get('/memories/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1474,7 +1254,6 @@ app.get('/memories/:userId', async (req, res) => {
   }
 });
 
-// Add endpoint to get a specific memory
 app.get('/memory/:userId/:memoryId', async (req, res) => {
   try {
     const { userId, memoryId } = req.params;
@@ -1506,7 +1285,6 @@ app.get('/memory/:userId/:memoryId', async (req, res) => {
   }
 });
 
-// Add endpoint to get conversation reflections
 app.get('/reflections/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1548,47 +1326,6 @@ app.get('/reflections/:userId', async (req, res) => {
     });
   }
 });
-
-// Helper function to extract topics using OpenAI
-async function extractTopicsUsingOpenAI(text) {
-  try {
-    const prompt = `
-      Analyze this text and identify the primary topic category:
-      "${text.substring(0, 300)}"
-
-      Choose ONE of these categories that best matches:
-      - conversation
-      - nutrition
-      - productivity
-      - health
-      - learning
-      - social
-      - general
-
-      Return ONLY the category name, no explanations.
-    `;
-
-    const result = await openai.chat.completions.create({
-      model: MODELS.REASONING,
-      messages: [{ role: 'user', content: prompt }],
-      temperature: 0.7,
-      max_tokens: 1000,
-      top_p: 1,
-      frequency_penalty: 0,
-      presence_penalty: 0
-    });
-    const category = result.choices[0].message.content.trim().toLowerCase();
-
-    if (Object.keys(agents).includes(category)) {
-      return category;
-    }
-
-    return 'general';
-  } catch (error) {
-    logger.error('Error extracting topics using OpenAI:', error);
-    return 'general';
-  }
-}
 
 const PORT = process.env.PORT || 8000;
 app.listen(PORT, () => {
