@@ -2,6 +2,8 @@ const express = require('express');
 const dotenv = require('dotenv');
 const { OpenAI } = require('openai');
 const winston = require('winston');
+const path = require('path');
+const fs = require('fs');
 // Import Firebase modules
 const { db, admin, documentIdFromSeed, createRequiredIndexes, initializeCollections, COLLECTIONS } = require('./firebase');
 const memories = require('./memories');
@@ -9,19 +11,54 @@ const uuid = require('uuid');
 
 dotenv.config();
 
+// Create logs directory if it doesn't exist
+const logDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logDir)) {
+  fs.mkdirSync(logDir, { recursive: true });
+}
+
 // Configure Winston logger first
 const logger = winston.createLogger({
-  level: 'info',
+  level: process.env.LOG_LEVEL || 'info',
   format: winston.format.combine(
     winston.format.timestamp(),
     winston.format.json()
   ),
   transports: [
-    new winston.transports.File({ filename: 'mentor.log' }),
+    new winston.transports.File({
+      filename: path.join(logDir, 'error.log'),
+      level: 'error',
+      maxsize: 5242880, // 5MB
+      maxFiles: 5,
+    }),
+    new winston.transports.File({
+      filename: path.join(logDir, 'combined.log'),
+      maxsize: 5242880, // 5MB
+      maxFiles: 5,
+    }),
     new winston.transports.Console({
-      format: winston.format.simple()
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple()
+      )
     })
-  ]
+  ],
+  // Prevent exit on error
+  exitOnError: false
+});
+
+// Handle uncaught exceptions
+logger.exceptions.handle(
+  new winston.transports.File({
+    filename: path.join(logDir, 'exceptions.log'),
+    maxsize: 5242880, // 5MB
+    maxFiles: 5,
+  })
+);
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (ex) => {
+  throw ex;
 });
 
 // Import ApiQueue after logger is initialized
@@ -42,20 +79,16 @@ const openaiQueue = new ApiQueue({
 
 // OpenAI model configurations
 const MODELS = {
-  REASONING: 'gpt-4',  // Changed from gpt-4-turbo-preview to gpt-4
-  CONVERSATION: 'gpt-4', // Changed from gpt-4-turbo-preview to gpt-4
-  QUICK: 'gpt-4'  // Changed from gpt-3.5-turbo to gpt-4
+  // GPT-4O Mini pricing: $0.15/1K prompt tokens, $0.60/1K completion tokens
+  // Base cost: $0.075 per 1K tokens
+  REASONING: 'gpt-4o-mini-2024-07-18',  // Using GPT-4O Mini for cost-effective reasoning
+  CONVERSATION: 'gpt-4o-mini-2024-07-18', // Using GPT-4O Mini for efficient conversation analysis
+  QUICK: 'gpt-4o-mini-2024-07-18'  // Using GPT-4O Mini for quick responses
 };
 
 // Initialize Express app
 const app = express();
 app.use(express.json());
-
-// Initialize Supabase
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
 
 // Add these constants at the top of your file
 const SILENCE_THRESHOLD = 1.0; // 1 second gap between segments to consider it a silence
